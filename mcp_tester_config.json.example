@@ -1,0 +1,17 @@
+{
+    "oauth": {
+        "enabled": false,
+        "issuer": "https://<your-org>.okta.com/oauth2/default",
+        "client_id": "<your-client-id>",
+        "client_secret": "",
+        "redirect_uri": "http://localhost:8080/callback",
+        "scope": "openid profile",
+        "send_resource": false,
+        "dcr": false,
+        "dcr_options": {
+            "client_name": "mcpTester",
+            "token_endpoint_auth_method": "none",
+            "initial_access_token": ""
+        }
+    }
+}

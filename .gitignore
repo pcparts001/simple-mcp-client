@@ -1,0 +1,33 @@
+# Secrets / local config (シークレットが含まれるため絶対コミットしない)
+mcp_tester_config.json
+api_keys.txt
+config.txt
+settings.json
+
+# Claude
+CLAUDE.md
+CLAUDE.md.backup
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
