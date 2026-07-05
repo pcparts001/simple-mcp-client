@@ -1,37 +1,36 @@
-# simple-mcp-client（mcpTester）
+# simple-mcp-client (mcpTester)
 
-MCP Server の動作検証用 CLI ツール **`mcpTester.py`** の単体プロジェクトです。
-元プロジェクト（`basic-llm-chatbot-glm-cleanup`）から、テスト用 MCP Client 機能だけを切り出しました。
+A standalone CLI tool **`mcpTester.py`** for verifying that an MCP Server works correctly.
 
-## 概要
+## Overview
 
-`mcpTester.py` は、実装した MCP Server が正しく動作するかを別環境から素早く検証するための CLI スクリプトです。
+`mcpTester.py` is a CLI script to quickly verify an implemented MCP Server from another environment.
 
-- **標準ライブラリのみで動作**（LLM や function calling は使わない）
-- JSON-RPC で MCP Server と通信し、`initialize` / `tools/list` / `tools/call` / `ping` / `prompts/list` / `resources/list` を順に検証
-- OAuth 2.1 + PKCE（Authorization Code Flow）にオプション対応
-  - `oauth.enabled=true` のとき IdP と連携して Bearer トークンを取得し、全リクエストに付与
-  - 無効時は認証なしで動作
-- 以下の仕様に対応
-  - RFC 9728（Protected Resource Metadata による IdP 自動発見）
-  - RFC 7591（Dynamic Client Registration）
-  - RFC 8707（resource parameter）
+- **Runs on the standard library only** (no LLM or function calling)
+- Communicates with the MCP Server via JSON-RPC and sequentially verifies `initialize` / `tools/list` / `tools/call` / `ping` / `prompts/list` / `resources/list`
+- Optional OAuth 2.1 + PKCE (Authorization Code Flow) support
+  - When `oauth.enabled=true`, it works with the IdP to obtain a Bearer token and attaches it to all requests
+  - When disabled, it runs unauthenticated
+- Supports the following specs
+  - RFC 9728 (automatic IdP discovery via Protected Resource Metadata)
+  - RFC 7591 (Dynamic Client Registration)
+  - RFC 8707 (resource parameter)
 
-## 前提
+## Prerequisites
 
-- Python 3（標準ライブラリのみ。追加パッケージ不要）
+- Python 3 (standard library only; no extra packages required)
 
-## セットアップ
+## Setup
 
-### 設定ファイルの作成
+### Create the config file
 
-`mcp_tester_config.json.example` をコピーして `mcp_tester_config.json` を作成し、環境に合わせて編集します。
+Copy `mcp_tester_config.json.example` to `mcp_tester_config.json` and edit it for your environment.
 
 ```bash
 cp mcp_tester_config.json.example mcp_tester_config.json
 ```
 
-**認証なしでテストする場合**（OAuth を使わない）は、`enabled` を `false` にするだけで OK です。
+**To test without authentication** (no OAuth), simply set `enabled` to `false`.
 
 ```json
 {
@@ -41,47 +40,47 @@ cp mcp_tester_config.json.example mcp_tester_config.json
 }
 ```
 
-**OAuth を使う場合**は、IdP の値で `issuer` / `client_id` / `client_secret` / `scope` 等を設定してください（詳しくは example ファイル内のコメントを参照）。
+**To use OAuth**, set `issuer` / `client_id` / `client_secret` / `scope`, etc. to your IdP's values (see the comments in the example file for details).
 
-> ⚠️ **注意**: `mcp_tester_config.json` にはシークレットが含まれるため、`.gitignore` で除外されています。**絶対にコミットしないでください。**
+> ⚠️ **Note**: `mcp_tester_config.json` may contain secrets and is excluded by `.gitignore`. **Never commit it.**
 
-## 使い方
+## Usage
 
 ```bash
-# デフォルト（http://localhost:9000）を検証
+# Check the default (http://localhost:9000)
 python3 mcpTester.py
 
-# URL を明示的に指定
+# Specify the URL explicitly
 python3 mcpTester.py http://localhost:9000
 python3 mcpTester.py http://192.168.1.10:9000
 
-# 環境変数で指定
+# Specify via environment variable
 MCP_SERVER_URL=http://host:9000 python3 mcpTester.py
 ```
 
-## 検証ステップ
+## Verification steps
 
-1. **OAuth 認証**（`oauth.enabled=true` のときのみ）— Authorization Code Flow + PKCE でアクセストークンを取得
-2. **Health Check**（GET）
+1. **OAuth authentication** (only when `oauth.enabled=true`) — obtains an access token via the Authorization Code Flow + PKCE
+2. **Health Check** (GET)
 3. **`initialize`**
 4. **`tools/list`**
-5. **`tools/call`** — サーバに `get_test_string` / `echo` / `check_maintenance` が存在すれば実際に呼び出し
-6. **その他** — `ping` / `prompts/list` / `resources/list`
+5. **`tools/call`** — actually invokes `get_test_string` / `echo` / `check_maintenance` if they exist on the server
+6. **Others** — `ping` / `prompts/list` / `resources/list`
 
-## 終了コード
+## Exit codes
 
-| コード | 意味 |
+| Code | Meaning |
 |:---:|:---|
-| `0` | すべてのステップが成功 |
-| `1` | いずれかのステップが失敗 |
+| `0` | All steps passed |
+| `1` | Any step failed |
 
-## ディレクトリ構成
+## Directory layout
 
 ```
 simple-mcp-client/
-├── mcpTester.py                     # 本体（テスト用 MCP Client）
-├── mcp_tester_config.json.example   # 設定ファイル テンプレート
-├── requirements.txt                 # （依存なし・標準ライブラリのみで動作）
+├── mcpTester.py                     # main script (test MCP Client)
+├── mcp_tester_config.json.example   # config template
+├── requirements.txt                 # (no dependencies; runs on the standard library)
 ├── .gitignore
 └── README.md
 ```
