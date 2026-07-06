@@ -56,6 +56,11 @@ python3 mcpTester.py http://192.168.1.10:9000
 
 # Specify via environment variable
 MCP_SERVER_URL=http://host:9000 python3 mcpTester.py
+
+# Run a SINGLE tool only: python3 mcpTester.py <URL> <TOOL_NAME>
+# (initializes -> tools/list (existence check) -> tools/call for that tool only)
+python3 mcpTester.py http://localhost:9000 check_maintenance
+python3 mcpTester.py http://localhost:9000 get_test_string
 ```
 
 ## Verification steps
@@ -66,6 +71,12 @@ MCP_SERVER_URL=http://host:9000 python3 mcpTester.py
 4. **`tools/list`**
 5. **`tools/call`** — actually invokes `get_test_string` / `echo` / `check_maintenance` if they exist on the server
 6. **Others** — `ping` / `prompts/list` / `resources/list`
+
+> **Single-tool mode** — pass a tool name as the second argument to invoke only that tool:
+> ```bash
+> python3 mcpTester.py http://localhost:9000 check_maintenance
+> ```
+> Runs `initialize` → `tools/list` (verifies the tool exists) → `tools/call` for the specified tool only. `ping` / `prompts/list` / `resources/list` are skipped. Arguments default to the built-in values for known tools (`get_test_string`, `echo`, `check_maintenance`) and to `{}` for any other tool.
 
 ## Exit codes
 

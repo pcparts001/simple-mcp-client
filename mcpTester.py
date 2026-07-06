@@ -585,6 +585,15 @@ def load_tester_config(config_path="mcp_tester_config.json"):
 # MCP Tester main body
 # ===========================================================================
 
+# Hardcoded arguments used when invoking a known tool in single-tool mode.
+# Unknown tools are called with empty arguments.
+SINGLE_TOOL_ARGUMENTS = {
+    "get_test_string": {"prefix": "Hello"},
+    "echo": {"message": "ping"},
+    "check_maintenance": {},
+}
+
+
 class MCPTester:
     """Client that performs a quick verification of the MCP server."""
 
@@ -834,6 +843,58 @@ class MCPTester:
         self._print_summary()
         return self.failed == 0
 
+    def run_single_tool(self, tool_name):
+        """Invoke a single specified tool only:
+        oauth -> health check -> initialize -> tools/list (existence check) -> tools/call."""
+        oauth_on = bool(self.oauth_client and self.oauth_client.enabled)
+        mode = "OAuth 2.1+PKCE" if oauth_on else "no auth"
+        print(bold(f"MCP Server Tester → {self.base_url}")
+              + yellow(f"  [{mode}, single-tool]") + f"  tool={tool_name}  (timeout={self.timeout}s)")
+
+        # 0. OAuth authentication (only when enabled)
+        if oauth_on:
+            if not self.step_oauth():
+                self._print_summary()
+                return False
+
+        # 1. Health check (early exit if the server is unreachable)
+        self.step_health_check()
+        if self.failed > 0:
+            self._print_summary()
+            return False
+
+        # 2. initialize
+        self.step_initialize()
+
+        # 3. tools/list — verify the requested tool exists on the server
+        self._section("3. tools/list (verify tool exists)")
+        try:
+            resp = self._post_jsonrpc("tools/list", {})
+        except Exception as e:
+            self._fail("tools/list", str(e))
+            self._print_summary()
+            return False
+        if "error" in resp:
+            self._fail("tools/list", self._err_text(resp["error"]))
+            self._print_summary()
+            return False
+        tool_names = [t.get("name", "?") for t in resp.get("result", {}).get("tools", [])]
+        if tool_name not in tool_names:
+            available = ", ".join(tool_names) if tool_names else "(none)"
+            self._fail(f"tools/call: {tool_name}",
+                       f"tool not found on server. available: {available}")
+            self._print_summary()
+            return False
+        self._ok(f"tools/call: {tool_name}",
+                 f"tool exists on server ({len(tool_names)} tool(s) listed)")
+
+        # 4. tools/call — invoke only the requested tool
+        self._section("4. tools/call (invoke single tool)")
+        self.step_call_tool(tool_name, SINGLE_TOOL_ARGUMENTS.get(tool_name, {}))
+
+        self._print_summary()
+        return self.failed == 0
+
     def _print_summary(self):
         total = self.passed + self.failed
         print()
@@ -845,18 +906,22 @@ class MCPTester:
         print(bold("─" * 60))
 
 
-def resolve_url(argv):
+def resolve_args(argv):
+    """Resolve (url, tool_name) from argv.
+    url is argv[1] (or MCP_SERVER_URL env / default);
+    tool_name is argv[2] when present -> single-tool mode."""
     if len(argv) > 1:
         url = argv[1]
     else:
         url = os.environ.get("MCP_SERVER_URL", "http://localhost:9000")
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "http://" + url
-    return url
+    tool_name = argv[2] if len(argv) > 2 else None
+    return url, tool_name
 
 
 def main():
-    base_url = resolve_url(sys.argv)
+    base_url, tool_name = resolve_args(sys.argv)
     config_path = "mcp_tester_config.json"
     tester_config = load_tester_config(config_path)
     oauth_client = OAuthClient(
@@ -864,7 +929,7 @@ def main():
         config_path=config_path,
     )
     tester = MCPTester(base_url, oauth_client=oauth_client, timeout=15)
-    ok = tester.run()
+    ok = tester.run_single_tool(tool_name) if tool_name else tester.run()
     sys.exit(0 if ok else 1)
 
 
