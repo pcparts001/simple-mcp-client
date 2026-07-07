@@ -633,6 +633,7 @@ class MCPTester:
         self._id = 0
         self.passed = 0
         self.failed = 0
+        self.warnings = 0
         self.oauth_client = oauth_client
 
     def _next_id(self):
@@ -656,6 +657,13 @@ class MCPTester:
         msg = f"  {red('❌')} {label}"
         if detail:
             msg += f"\n     {red(detail)}"
+        print(msg)
+
+    def _warn(self, label, detail=""):
+        self.warnings += 1
+        msg = f"  {yellow('⚠️')} {label}"
+        if detail:
+            msg += f"\n     {detail}"
         print(msg)
 
     @staticmethod
@@ -744,7 +752,13 @@ class MCPTester:
                 self._ok(f"Server is reachable (HTTP {e.code})",
                          f"{self.base_url} — GET/auth rejected but server is up")
             else:
-                self._fail("Health check failed", f"HTTP {e.code} at {self.base_url}")
+                # Any other 4xx/5xx still proves the server is reachable (the
+                # request was received and processed enough to return an HTTP
+                # status). Warn and continue — subsequent steps may still work
+                # or surface more specific error detail (e.g. 500/502/503).
+                self._warn(
+                    f"Server reachable but returned HTTP {e.code} (continuing)",
+                    f"{self.base_url} — server is up, will try subsequent steps")
         except urllib.error.URLError as e:
             self._fail("Cannot reach server", f"{self.base_url}  ({e.reason})")
         except Exception as e:
@@ -843,7 +857,8 @@ class MCPTester:
                 self._print_summary()
                 return False
 
-        # 1. Health check (early exit if server is down, since all subsequent steps will fail)
+        # 1. Health check (early exit only if the server is unreachable; server
+        #    errors such as 4xx/5xx are warnings and still proceed to initialize)
         self.step_health_check()
         if self.failed > 0:
             self._print_summary()
@@ -933,6 +948,8 @@ class MCPTester:
             print(green(f"✅ ALL PASSED  ({self.passed}/{total})"))
         else:
             print(red(f"❌ {self.failed} FAILED  ({self.passed}/{total} passed)"))
+        if self.warnings > 0:
+            print(yellow(f"⚠️ {self.warnings} warning(s)"))
         print(bold("─" * 60))
 
 
