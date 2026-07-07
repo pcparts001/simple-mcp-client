@@ -90,6 +90,30 @@ def generate_pkce():
     return verifier, challenge
 
 
+def _format_http_error(e, max_body=500):
+    """Render an urllib HTTPError into a diagnostic string: status line plus
+    the response body (truncated) and a few useful headers. Without this, the
+    body of 4xx/5xx responses is silently discarded, hiding the server's
+    explanation of *why* a request failed (e.g. the reason behind an HTTP 500).
+    """
+    try:
+        body = e.read().decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if len(body) > max_body:
+        body = body[:max_body] + f" ... ({len(body)} bytes total)"
+    parts = [f"HTTP {e.code} {e.reason}"]
+    interesting = ("WWW-Authenticate", "Content-Type", "Server",
+                   "X-Request-Id", "X-Correlation-Id")
+    hdrs = [f"{name}: {e.headers.get(name)}" for name in interesting
+            if e.headers.get(name)]
+    if hdrs:
+        parts.append("headers={{{}}}".format(", ".join(hdrs)))
+    if body:
+        parts.append(f"body={body}")
+    return " | ".join(parts)
+
+
 def fetch_as_metadata(issuer, timeout=15):
     """Fetch the IdP's metadata.
     Tries RFC 8414 (oauth-authorization-server), and falls back to
@@ -109,8 +133,9 @@ def fetch_as_metadata(issuer, timeout=15):
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
-            print(f"   [debug] -> HTTP {e.code}, trying next candidate...")
-            last_error = RuntimeError(f"HTTP {e.code} at {url}")
+            detail = _format_http_error(e)
+            print(f"   [debug] -> {detail}, trying next candidate...")
+            last_error = RuntimeError(f"{detail} at {url}")
         except urllib.error.URLError as e:
             print(f"   [debug] -> {e.reason}, trying next candidate...")
             last_error = RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
@@ -197,7 +222,7 @@ def fetch_protected_resource_metadata(resource_url, timeout=15):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP {e.code} at {url}")
+        raise RuntimeError(f"{_format_http_error(e)} at {url}")
     except urllib.error.URLError as e:
         raise RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
 
@@ -242,10 +267,15 @@ def _probe_401_resource_metadata(resource_url, timeout=15):
         urllib.request.urlopen(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code != 401:
-            raise RuntimeError(f"Expected 401 challenge but got HTTP {e.code}")
+            raise RuntimeError(
+                f"Expected 401 challenge but got {_format_http_error(e)}"
+            )
         www_auth = e.headers.get("WWW-Authenticate", "")
         if not www_auth:
-            raise RuntimeError("401 returned without a WWW-Authenticate header")
+            raise RuntimeError(
+                "401 returned without a WWW-Authenticate header "
+                f"(response: {_format_http_error(e)})"
+            )
         # resource_metadata="https://..."  or  resource_metadata=https://...
         match = re.search(
             r'resource_metadata=("(?P<q>[^"]+)"|(?P<b>[^,\s]+))', www_auth
@@ -259,7 +289,7 @@ def _probe_401_resource_metadata(resource_url, timeout=15):
             with urllib.request.urlopen(req2, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e2:
-            raise RuntimeError(f"HTTP {e2.code} at {meta_url}")
+            raise RuntimeError(f"{_format_http_error(e2)} at {meta_url}")
         except urllib.error.URLError as e2:
             raise RuntimeError(f"Failed to fetch ({e2.reason}) at {meta_url}")
     # No 401 raised -> the resource is not protected through this path
