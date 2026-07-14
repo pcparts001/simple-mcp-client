@@ -125,6 +125,10 @@ def _format_http_error(e, max_body=500):
 
 _MAX_BODY_BYTES = 65536  # cap when reading response bodies
 
+# MCP Streamable HTTP requires the client to accept BOTH json and event-stream
+# on every request; many MCP gateways reject a single-type Accept with 406/400.
+_MCP_ACCEPT = "application/json, text/event-stream"
+
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Do not auto-follow 3xx. Surface the redirect as an HTTPError so the
@@ -175,18 +179,20 @@ def _parse_resource_metadata_param(www_authenticate):
     return (m.group("q") or m.group("b")) if m else None
 
 
-def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES):
+def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES, accept=_MCP_ACCEPT):
     """GET ``url`` and return the decoded JSON object.
 
     Hardened for discovery against an MCP gateway that may answer a well-known
     GET with an event-stream or a redirect to an IdP login page:
       1. no auto-follow of 3xx
-      2. Accept: application/json
+      2. Accept advertises both application/json and text/event-stream
+         (MCP Streamable HTTP requires both; defaults to _MCP_ACCEPT)
       3. reject any non-application/json Content-Type immediately
       4. read the body with a hard cap (never block on a stream)
     Any failure is normalized to a RuntimeError so callers can fall back.
+    Pass accept="application/json" when talking to a plain IdP endpoint.
     """
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    req = urllib.request.Request(url, headers={"Accept": accept})
     try:
         resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
@@ -276,7 +282,7 @@ def fetch_as_metadata(issuer, timeout=15):
     for url in candidates:
         print(f"   [debug] trying AS metadata: {url}")
         try:
-            return _http_get_json(url, timeout=timeout)
+            return _http_get_json(url, timeout=timeout, accept="application/json")
         except RuntimeError as e:
             print(f"   [debug] -> {e}, trying next candidate...")
             last_error = e
@@ -397,7 +403,7 @@ def _probe_401_challenge(resource_url, timeout=15):
     req = urllib.request.Request(
         resource_url.rstrip("/"),
         data=data,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={"Content-Type": "application/json", "Accept": _MCP_ACCEPT},
         method="POST",
     )
     try:
@@ -837,7 +843,9 @@ class MCPTester:
     # --- HTTP communication ---
     def _get(self, url=None):
         target = url or self.base_url
-        req = urllib.request.Request(target, method="GET", headers=self._auth_headers())
+        req = urllib.request.Request(
+            target, method="GET",
+            headers=self._auth_headers({"Accept": _MCP_ACCEPT}))
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
             body = resp.read().decode("utf-8", errors="replace")
             return resp.status, body
@@ -855,7 +863,7 @@ class MCPTester:
             data=data,
             headers=self._auth_headers({
                 "Content-Type": "application/json",
-                "Accept": "application/json",
+                "Accept": _MCP_ACCEPT,
             }),
             method="POST",
         )
