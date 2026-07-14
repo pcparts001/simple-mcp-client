@@ -97,7 +97,7 @@ def _format_http_error(e, max_body=500):
     explanation of *why* a request failed (e.g. the reason behind an HTTP 500).
     """
     try:
-        body = e.read().decode("utf-8", errors="replace").strip()
+        body = _read_capped(e, max_body).decode("utf-8", errors="replace").strip()
     except Exception:
         body = ""
     if len(body) > max_body:
@@ -114,6 +114,153 @@ def _format_http_error(e, max_body=500):
     return " | ".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# HTTP helpers: hardened urllib wrappers that prevent the SSE / redirect
+# hangs which block discovery when an MCP gateway answers a well-known GET
+# with an event-stream or a 302 to the IdP login page. They guarantee:
+#   * 3xx responses are NOT auto-followed (we stay on the metadata URL)
+#   * only application/json bodies are decoded (reject SSE/HTML early)
+#   * the body is read with a hard cap (no unbounded blocking on streams)
+# ---------------------------------------------------------------------------
+
+_MAX_BODY_BYTES = 65536  # cap when reading response bodies
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Do not auto-follow 3xx. Surface the redirect as an HTTPError so the
+    status code and headers (Location, WWW-Authenticate) stay accessible.
+
+    Returning ``None`` is NOT enough: ``http_error_30x`` swallows a None
+    return and hands the 3xx back as a normal response without raising.
+    Raising HTTPError is the verified way to stop the redirect chain.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+# build_opener *replaces* the default HTTPRedirectHandler with our subclass
+# while keeping ProxyHandler/HTTPSHandler etc., so no regression for TLS/proxy.
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _is_json_content_type(ct):
+    """True when Content-Type is application/json (ignores '; charset=...')."""
+    if not ct:
+        return False
+    return ct.split(";", 1)[0].strip().lower() == "application/json"
+
+
+def _read_capped(resp, limit=_MAX_BODY_BYTES):
+    """Read at most ``limit`` bytes from ``resp``.
+
+    Both http.client.HTTPResponse.read and urllib.error.HTTPError.read accept
+    a size argument and return immediately once that many bytes arrive, so a
+    streaming/event-stream body cannot block us indefinitely.
+    """
+    return resp.read(limit + 1)[:limit]
+
+
+def _parse_resource_metadata_param(www_authenticate):
+    """Extract the ``resource_metadata`` URL from a WWW-Authenticate header.
+
+    Accepts both quoted (resource_metadata="https://...") and bare
+    (resource_metadata=https://...) forms, tolerating surrounding spaces.
+    Returns the URL string or None if absent.
+    """
+    m = re.search(
+        r'resource_metadata\s*=\s*("(?P<q>[^"]+)"|(?P<b>[^\s,]+))',
+        www_authenticate or "",
+    )
+    return (m.group("q") or m.group("b")) if m else None
+
+
+def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES):
+    """GET ``url`` and return the decoded JSON object.
+
+    Hardened for discovery against an MCP gateway that may answer a well-known
+    GET with an event-stream or a redirect to an IdP login page:
+      1. no auto-follow of 3xx
+      2. Accept: application/json
+      3. reject any non-application/json Content-Type immediately
+      4. read the body with a hard cap (never block on a stream)
+    Any failure is normalized to a RuntimeError so callers can fall back.
+    """
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    try:
+        resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"{_format_http_error(e)} at {url}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
+    with resp:
+        status = getattr(resp, "status", None) or resp.getcode()
+        ct = resp.headers.get("Content-Type", "")
+        if not _is_json_content_type(ct):
+            raise RuntimeError(
+                f"Expected application/json at {url} (HTTP {status}), "
+                f"got Content-Type {ct!r}"
+            )
+        body = _read_capped(resp, max_bytes).decode("utf-8", errors="replace")
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"Invalid JSON at {url}: {e}; body[:200]={body[:200]!r}"
+        )
+
+
+def _build_resource_metadata_url(resource_url, suffix="oauth-protected-resource"):
+    """Build the RFC 9728 §3 protected-resource metadata URL.
+
+    ``/.well-known/<suffix>`` is inserted BETWEEN the host and the path/query
+    (not appended at the end). Per RFC 9728 §3:
+      https://h.ex.com           -> https://h.ex.com/.well-known/oauth-protected-resource
+      https://h.ex.com/r1        -> https://h.ex.com/.well-known/oauth-protected-resource/r1
+      https://h.ex.com/a/b/c?q=1 -> https://h.ex.com/.well-known/oauth-protected-resource/a/b/c?q=1
+    Idempotent: returns the input unchanged if it already contains the suffix.
+    """
+    parts = urllib.parse.urlsplit(resource_url)
+    if not parts.scheme or not parts.netloc:
+        raise ValueError(f"resource_url must be absolute: {resource_url!r}")
+    path = parts.path or ""
+    if f".well-known/{suffix}" in path:
+        return resource_url
+    rest = path.lstrip("/")
+    new_path = (f"/.well-known/{suffix}/{rest}" if rest
+                else f"/.well-known/{suffix}")
+    return urllib.parse.urlunsplit(
+        (parts.scheme, parts.netloc, new_path, parts.query, parts.fragment))
+
+
+def _build_origin_metadata_url(resource_url, suffix="oauth-protected-resource"):
+    """Practical fallback: ignore the path and use the origin's well-known URL.
+
+    Many MCP gateways publish one shared metadata document at the origin
+    regardless of the tenant/server path.
+    """
+    parts = urllib.parse.urlsplit(resource_url)
+    if not parts.scheme or not parts.netloc:
+        raise ValueError(f"resource_url must be absolute: {resource_url!r}")
+    return f"{parts.scheme}://{parts.netloc}/.well-known/{suffix}"
+
+
+def _validate_resource(metadata, expected_resource_url, via=""):
+    """RFC 9728 §3.3: metadata['resource'] must match the resource we fetched
+    it for. Warn-only here, to tolerate Cisco GW normalization differences
+    rather than rejecting the data outright.
+    """
+    if not isinstance(metadata, dict):
+        return
+    got = metadata.get("resource")
+    exp = (expected_resource_url or "").rstrip("/")
+    if got and str(got).rstrip("/") != exp:
+        print(yellow(
+            f"   [discover] resource mismatch via {via}: "
+            f"metadata.resource={got!r} expected~={exp!r} (continuing; "
+            f"RFC 9728 §3.3 says data MUST NOT be used if mismatched)"))
+
+
 def fetch_as_metadata(issuer, timeout=15):
     """Fetch the IdP's metadata.
     Tries RFC 8414 (oauth-authorization-server), and falls back to
@@ -128,17 +275,11 @@ def fetch_as_metadata(issuer, timeout=15):
     last_error = None
     for url in candidates:
         print(f"   [debug] trying AS metadata: {url}")
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            detail = _format_http_error(e)
-            print(f"   [debug] -> {detail}, trying next candidate...")
-            last_error = RuntimeError(f"{detail} at {url}")
-        except urllib.error.URLError as e:
-            print(f"   [debug] -> {e.reason}, trying next candidate...")
-            last_error = RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
+            return _http_get_json(url, timeout=timeout)
+        except RuntimeError as e:
+            print(f"   [debug] -> {e}, trying next candidate...")
+            last_error = e
     raise last_error or RuntimeError("Failed to fetch AS metadata from all candidates")
 
 
@@ -210,21 +351,13 @@ def register_client(registration_endpoint, redirect_uri, scope,
 #     resource (the MCP server) when `issuer` is not configured.
 # ---------------------------------------------------------------------------
 
-def fetch_protected_resource_metadata(resource_url, timeout=15):
-    """[Route A] Fetch the RFC 9728 protected resource metadata document.
-    GET {resource_url}/.well-known/oauth-protected-resource and return the JSON.
+def fetch_protected_resource_metadata(meta_url, timeout=15):
+    """Fetch the RFC 9728 protected-resource metadata document at ``meta_url``
+    and return the parsed JSON. URL construction (RFC §3 host/path insertion)
+    is handled by _build_resource_metadata_url / _build_origin_metadata_url.
     """
-    base = resource_url.rstrip("/")
-    url = base + "/.well-known/oauth-protected-resource"
-    print(f"   [discover] trying protected resource metadata: {url}")
-    req = urllib.request.Request(url, headers={"Accept": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"{_format_http_error(e)} at {url}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
+    print(f"   [discover] trying protected resource metadata: {meta_url}")
+    return _http_get_json(meta_url, timeout=timeout)
 
 
 def _extract_issuer_from_protected_metadata(metadata):
@@ -242,10 +375,14 @@ def _extract_issuer_from_protected_metadata(metadata):
     return issuer
 
 
-def _probe_401_resource_metadata(resource_url, timeout=15):
-    """[Route B fallback] Trigger a 401 by sending an unauthenticated JSON-RPC
+def _probe_401_challenge(resource_url, timeout=15):
+    """[Route B] Trigger a 401 by sending an unauthenticated JSON-RPC
     `initialize`, read the `WWW-Authenticate` header to find a
-    `resource_metadata` URL, and fetch that metadata document. Returns the JSON.
+    `resource_metadata` URL, and fetch that metadata document. Returns the
+    parsed JSON.
+
+    Uses the no-redirect opener and never reads the 401 body, so an
+    event-stream or HTML 401 cannot block us.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -264,34 +401,29 @@ def _probe_401_resource_metadata(resource_url, timeout=15):
         method="POST",
     )
     try:
-        urllib.request.urlopen(req, timeout=timeout)
+        _NO_REDIRECT_OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
         if e.code != 401:
             raise RuntimeError(
-                f"Expected 401 challenge but got {_format_http_error(e)}"
+                f"Expected 401 challenge but got HTTP {e.code} "
+                f"({_format_http_error(e)})"
             )
         www_auth = e.headers.get("WWW-Authenticate", "")
         if not www_auth:
             raise RuntimeError(
                 "401 returned without a WWW-Authenticate header "
-                f"(response: {_format_http_error(e)})"
+                f"(header was empty; status {_format_http_error(e)})"
             )
-        # resource_metadata="https://..."  or  resource_metadata=https://...
-        match = re.search(
-            r'resource_metadata=("(?P<q>[^"]+)"|(?P<b>[^,\s]+))', www_auth
-        )
-        if not match:
-            raise RuntimeError("WWW-Authenticate has no resource_metadata parameter")
-        meta_url = match.group("q") or match.group("b")
-        print(f"   [discover] resource_metadata pointed to: {meta_url}")
-        req2 = urllib.request.Request(meta_url, headers={"Accept": "application/json"})
-        try:
-            with urllib.request.urlopen(req2, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e2:
-            raise RuntimeError(f"{_format_http_error(e2)} at {meta_url}")
-        except urllib.error.URLError as e2:
-            raise RuntimeError(f"Failed to fetch ({e2.reason}) at {meta_url}")
+        meta_url = _parse_resource_metadata_param(www_auth)
+        if not meta_url:
+            raise RuntimeError(
+                "WWW-Authenticate has no resource_metadata parameter "
+                f"(header: {www_auth[:200]!r})"
+            )
+        print(f"   [discover] 401 resource_metadata pointed to: {meta_url}")
+        return _http_get_json(meta_url, timeout=timeout)
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to reach resource for 401 probe ({e.reason})")
     # No 401 raised -> the resource is not protected through this path
     raise RuntimeError("No 401 challenge received (resource may be public)")
 
@@ -300,30 +432,53 @@ def discover_issuer(resource_url, timeout=15):
     """Discover the authorization server (issuer) URI from the protected
     resource (MCP server) per RFC 9728. Used only when `issuer` is not set.
 
-    Order:
-      A) GET {resource_url}/.well-known/oauth-protected-resource  (canonical)
-      B) Trigger a 401 and follow the WWW-Authenticate resource_metadata hint
+    Order (RFC 9728 / MCP Authorization: the WWW-Authenticate hint wins):
+      B)  401 challenge -> WWW-Authenticate resource_metadata   (preferred)
+      A1) RFC §3 strict well-known (host/path insertion)
+      A2) origin well-known fallback (path ignored)
 
-    Returns the discovered issuer URI. Raises if neither route yields one.
+    Returns the discovered issuer URI. Raises RuntimeError if all routes fail.
     """
     resource = resource_url.rstrip("/")
-    print(f"   [discover] issuer not configured; discovering from resource: {resource}")
+    print(f"   [discover] issuer not configured; discovering via RFC 9728: {resource}")
 
-    # Route A: canonical well-known endpoint
+    # Route B: 401 challenge (RFC 9728 §5 — the WWW-Authenticate hint wins)
     try:
-        metadata = fetch_protected_resource_metadata(resource, timeout)
+        metadata = _probe_401_challenge(resource, timeout=timeout)
+        _validate_resource(metadata, resource, via="401 challenge")
         issuer = _extract_issuer_from_protected_metadata(metadata)
-        print(f"   {green('[discover] found authorization server via RFC 9728:')} {issuer}")
+        print(f"   {green('[discover] found AS via 401 WWW-Authenticate:')} {issuer}")
         return issuer
     except Exception as e:
-        print(f"   {yellow('[discover] route A failed')} ({e})")
+        print(f"   {yellow('[discover] Route B (401 challenge) failed')} ({e})")
 
-    # Route B: 401 challenge via WWW-Authenticate resource_metadata
-    print(f"   {yellow('[discover] falling back to 401 challenge (WWW-Authenticate)')}")
-    metadata = _probe_401_resource_metadata(resource, timeout)
-    issuer = _extract_issuer_from_protected_metadata(metadata)
-    print(f"   {green('[discover] found authorization server via 401 challenge:')} {issuer}")
-    return issuer
+    # Route A1: RFC 9728 §3 strict well-known (host/path insertion)
+    strict_url = _build_resource_metadata_url(resource)
+    try:
+        metadata = fetch_protected_resource_metadata(strict_url, timeout=timeout)
+        _validate_resource(metadata, resource, via="RFC §3.1 strict path")
+        issuer = _extract_issuer_from_protected_metadata(metadata)
+        print(f"   {green('[discover] found AS via RFC 9728 §3 path:')} {issuer}")
+        return issuer
+    except Exception as e:
+        print(f"   {yellow('[discover] Route A1 (RFC strict path) failed')} ({e})")
+
+    # Route A2: origin well-known fallback (path ignored)
+    origin_url = _build_origin_metadata_url(resource)
+    try:
+        metadata = fetch_protected_resource_metadata(origin_url, timeout=timeout)
+        _validate_resource(metadata, resource, via="origin fallback")
+        issuer = _extract_issuer_from_protected_metadata(metadata)
+        print(f"   {green('[discover] found AS via origin well-known:')} {issuer}")
+        return issuer
+    except Exception as e:
+        print(f"   {yellow('[discover] Route A2 (origin fallback) failed')} ({e})")
+
+    raise RuntimeError(
+        "RFC 9728 discovery exhausted all routes (401 challenge, strict path, "
+        f"origin fallback) for {resource}. Set 'issuer' manually in "
+        "mcp_tester_config.json."
+    )
 
 
 class _CallbackHandler(BaseHTTPRequestHandler):
