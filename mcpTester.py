@@ -165,6 +165,34 @@ def _read_capped(resp, limit=_MAX_BODY_BYTES):
     return resp.read(limit + 1)[:limit]
 
 
+def _parse_sse_payload(body):
+    """Extract the data payload of the first SSE event from ``body``.
+
+    MCP Streamable HTTP delivers JSON-RPC responses wrapped in Server-Sent
+    Events::
+
+        event: message
+        data: {"jsonrpc":"2.0","id":1,...}
+
+    Per the SSE spec, consecutive ``data:`` lines within ONE event are joined
+    with ``\\n``; a blank line ends the event. ``event:``/``id:``/``retry:``
+    lines and ``:`` comments are ignored. Returns the joined data payload of
+    the first event that carries data, or ``""`` when none is found (so the
+    caller's json.loads fails with a clear message instead of parsing noise).
+    """
+    data_lines = []
+    for line in body.splitlines():
+        line = line.rstrip("\r")
+        if line.startswith("data:"):
+            payload = line[5:]
+            if payload.startswith(" "):  # strip exactly one leading space
+                payload = payload[1:]
+            data_lines.append(payload)
+        elif line == "" and data_lines:
+            break  # event boundary after we have data -> first event done
+    return "\n".join(data_lines)
+
+
 def _parse_resource_metadata_param(www_authenticate):
     """Extract the ``resource_metadata`` URL from a WWW-Authenticate header.
 
@@ -396,6 +424,7 @@ def _probe_401_challenge(resource_url, timeout=15):
         "method": "initialize",
         "params": {
             "protocolVersion": "2024-11-05",
+            "capabilities": {},
             "clientInfo": {"name": "mcpTester", "version": "1.0.0"},
         },
     }
@@ -842,14 +871,36 @@ class MCPTester:
 
     # --- HTTP communication ---
     def _get(self, url=None):
+        """GET the endpoint. Returns (status, body, content_type).
+
+        Streamable HTTP MCP servers answer GET with an SSE event stream
+        (Content-Type: text/event-stream) that they keep open to push
+        server-initiated notifications; a plain ``resp.read()`` blocks
+        forever waiting for an EOF that never comes (server logs already
+        show 200 OK while the client hangs on the open stream).
+
+        So when the response is an event stream, drain only a single capped
+        chunk and return an empty body — the health check only needs the
+        status line to confirm the server is up. JSON bodies are read with
+        the same hard cap so no response can ever block us unbounded.
+        """
         target = url or self.base_url
         print(f"   → GET {target}")
         req = urllib.request.Request(
             target, method="GET",
             headers=self._auth_headers({"Accept": _MCP_ACCEPT}))
         with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return resp.status, body
+            status = resp.status
+            ct = resp.headers.get("Content-Type", "") or ""
+            if "text/event-stream" in ct.lower():
+                # SSE: the server keeps the stream open and may never send
+                # a single byte (it idles waiting for server-initiated
+                # events). Reading even one byte would block until timeout.
+                # The status line is already received — that is all the
+                # health check needs — so skip the body entirely and close.
+                return status, "", ct
+            body = _read_capped(resp).decode("utf-8", errors="replace")
+            return status, body, ct
 
     def _post_jsonrpc(self, method, params=None):
         payload = {
@@ -874,6 +925,7 @@ class MCPTester:
         )
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                ct = resp.headers.get("Content-Type", "") or ""
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
             resp_body = e.read().decode("utf-8", errors="replace").strip()
@@ -882,12 +934,18 @@ class MCPTester:
                 f"(JSON-RPC method={method}); response body: {resp_body[:300]}"
             )
 
+        # Streamable HTTP may return the JSON-RPC message inside an SSE
+        # envelope (Content-Type: text/event-stream). Unwrap it before parsing.
+        if "text/event-stream" in ct.lower():
+            body = _parse_sse_payload(body)
+
         try:
             return json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(
                 f"Invalid JSON response on POST {self.base_url} "
-                f"(JSON-RPC method={method}): {body[:300]}"
+                f"(JSON-RPC method={method}); content-type={ct!r}; "
+                f"body[:300]={body[:300]!r}"
             )
 
     # --- Steps ---
@@ -908,7 +966,16 @@ class MCPTester:
     def step_health_check(self):
         self._section("1. Health Check (GET)")
         try:
-            status, body = self._get()
+            status, body, ct = self._get()
+            # Streamable HTTP answers GET with an SSE stream (no JSON body);
+            # reaching a 200 here already proves the server is up and the
+            # JSON-RPC conversation runs over POST, so treat it as success.
+            if "text/event-stream" in (ct or "").lower():
+                self._ok(
+                    f"Server is responding (HTTP {status}, SSE stream)",
+                    f"{self.base_url} — Streamable HTTP event stream; "
+                    f"JSON-RPC runs over POST")
+                return
             try:
                 data = json.loads(body)
             except json.JSONDecodeError:
@@ -943,6 +1010,7 @@ class MCPTester:
         try:
             resp = self._post_jsonrpc("initialize", {
                 "protocolVersion": "2024-11-05",
+                "capabilities": {},
                 "clientInfo": {"name": "mcpTester", "version": "1.0.0"},
             })
             if "error" in resp:
