@@ -843,6 +843,7 @@ class MCPTester:
     # --- HTTP communication ---
     def _get(self, url=None):
         target = url or self.base_url
+        print(f"   → GET {target}")
         req = urllib.request.Request(
             target, method="GET",
             headers=self._auth_headers({"Accept": _MCP_ACCEPT}))
@@ -858,6 +859,10 @@ class MCPTester:
             "params": params or {},
         }
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        # Show the exact outgoing request so 404/4xx/5xx causes are visible:
+        # the HTTP method, the target URL, and the JSON-RPC body.
+        print(f"   → POST {self.base_url}")
+        print(f"     JSON-RPC method={method}  body={data.decode('utf-8')}")
         req = urllib.request.Request(
             self.base_url,
             data=data,
@@ -871,13 +876,19 @@ class MCPTester:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {e.code}: {body[:300]}")
+            resp_body = e.read().decode("utf-8", errors="replace").strip()
+            raise RuntimeError(
+                f"HTTP {e.code} {e.reason} on POST {self.base_url} "
+                f"(JSON-RPC method={method}); response body: {resp_body[:300]}"
+            )
 
         try:
             return json.loads(body)
         except json.JSONDecodeError:
-            raise RuntimeError(f"Invalid JSON response: {body[:300]}")
+            raise RuntimeError(
+                f"Invalid JSON response on POST {self.base_url} "
+                f"(JSON-RPC method={method}): {body[:300]}"
+            )
 
     # --- Steps ---
     def step_oauth(self):
