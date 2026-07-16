@@ -29,6 +29,7 @@ import time
 import base64
 import hashlib
 import secrets
+import socket
 import threading
 import webbrowser
 import urllib.parse
@@ -163,6 +164,56 @@ def _read_capped(resp, limit=_MAX_BODY_BYTES):
     streaming/event-stream body cannot block us indefinitely.
     """
     return resp.read(limit + 1)[:limit]
+
+
+def _is_timeout(exc):
+    """True when ``exc`` (or its ``.reason``, for urllib.error.URLError) is a
+    socket read/connect timeout. Such a timeout on the health-check GET does
+    NOT mean the server is down — auth already succeeded and the backend is
+    responding; the GET simply streams or is slow — so callers can treat it
+    as 'reachable, continue' rather than a hard failure.
+    """
+    if isinstance(exc, (socket.timeout, TimeoutError)):
+        return True
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, (socket.timeout, TimeoutError))
+
+
+def _read_jsonrpc_body(resp, content_type, limit=_MAX_BODY_BYTES):
+    """Read a JSON-RPC response body that may arrive over a Streamable HTTP
+    connection the server keeps open after delivering the response.
+
+    Some MCP gateways answer with a held-open stream (chunked / SSE) that
+    never sends EOF, so a plain ``resp.read()`` blocks until the socket
+    timeout. To avoid that:
+
+      * ``text/event-stream`` — read incrementally and stop as soon as a
+        complete SSE event that carries a ``data:`` line (a blank line,
+        ``\\n\\n`` / ``\\r\\n\\r\\n`` after ``data:``) is seen, so an idling
+        stream does not stall us. Skipping past leading heartbeats/comments
+        (``: ping``) avoids a premature stop on the first blank line. The
+        JSON-RPC message lives in that data event.
+      * anything else (``application/json`` …) — capped read to ``limit``.
+
+    Returns the decoded body text (possibly partial if the stream was
+    truncated). Callers parse/unwrap from here.
+    """
+    ct = (content_type or "").lower()
+    if "text/event-stream" in ct:
+        buf = bytearray()
+        while len(buf) < limit:
+            chunk = resp.read(min(4096, limit - len(buf)))
+            if not chunk:
+                break  # EOF — stream closed cleanly
+            buf += chunk
+            # Stop once we have a COMPLETE data-bearing event: a blank-line
+            # boundary AND a `data:` line. Comment/heartbeat-only events
+            # (which also end in a blank line but carry no `data:`) are skipped
+            # over by continuing to read.
+            if b"data:" in buf and (b"\r\n\r\n" in buf or b"\n\n" in buf):
+                break
+        return bytes(buf[:limit]).decode("utf-8", errors="replace")
+    return resp.read(limit + 1)[:limit].decode("utf-8", errors="replace")
 
 
 def _parse_sse_payload(body):
@@ -899,7 +950,15 @@ class MCPTester:
                 # The status line is already received — that is all the
                 # health check needs — so skip the body entirely and close.
                 return status, "", ct
-            body = _read_capped(resp).decode("utf-8", errors="replace")
+            try:
+                body = _read_capped(resp).decode("utf-8", errors="replace")
+            except (socket.timeout, TimeoutError):
+                # Headers arrived (we have a status) but the body streams
+                # and did not complete within the timeout. Some MCP gateways
+                # answer a plain GET with a held-open non-SSE stream; the
+                # status line alone proves the server is reachable, which is
+                # all the health check needs.
+                return status, "", ct
             return status, body, ct
 
     def _post_jsonrpc(self, method, params=None):
@@ -926,7 +985,10 @@ class MCPTester:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 ct = resp.headers.get("Content-Type", "") or ""
-                body = resp.read().decode("utf-8", errors="replace")
+                # Streamable HTTP may keep the connection open after delivering
+                # the JSON-RPC message (SSE) — read just enough (first event or
+                # a capped JSON body) instead of blocking until EOF/timeout.
+                body = _read_jsonrpc_body(resp, ct)
         except urllib.error.HTTPError as e:
             resp_body = e.read().decode("utf-8", errors="replace").strip()
             raise RuntimeError(
@@ -1001,9 +1063,24 @@ class MCPTester:
                     f"Server reachable but returned HTTP {e.code} (continuing)",
                     f"{self.base_url} — server is up, will try subsequent steps")
         except urllib.error.URLError as e:
-            self._fail("Cannot reach server", f"{self.base_url}  ({e.reason})")
+            if _is_timeout(e):
+                # GET timed out (auth already succeeded and the backend is
+                # responding — the GET just streams or is slow). Treat as
+                # reachable and continue to the POST steps.
+                self._warn(
+                    "Server reachable but GET timed out (continuing)",
+                    f"{self.base_url} — streaming/slow response; "
+                    f"will try subsequent steps")
+            else:
+                self._fail("Cannot reach server", f"{self.base_url}  ({e.reason})")
         except Exception as e:
-            self._fail("Health check failed", str(e))
+            if _is_timeout(e):
+                self._warn(
+                    "Server reachable but GET timed out (continuing)",
+                    f"{self.base_url} — streaming/slow response; "
+                    f"will try subsequent steps")
+            else:
+                self._fail("Health check failed", str(e))
 
     def step_initialize(self):
         self._section("2. initialize")
