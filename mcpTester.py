@@ -92,10 +92,15 @@ def generate_pkce():
 
 
 def _format_http_error(e, max_body=500):
-    """Render an urllib HTTPError into a diagnostic string: status line plus
-    the response body (truncated) and a few useful headers. Without this, the
-    body of 4xx/5xx responses is silently discarded, hiding the server's
-    explanation of *why* a request failed (e.g. the reason behind an HTTP 500).
+    """Render an urllib HTTPError into a compact one-line diagnostic: status
+    line plus the (truncated) body.
+
+    Headers are intentionally omitted here. Every caller already prints the
+    full response — status, ALL headers, body — via _dump_http_error_lines
+    just before raising, so emitting the headers again in this message would
+    duplicate them as one long, hard-to-read line in the surrounding
+    "Route X failed (...)" summary. The body is kept because it often carries
+    the server's human-readable reason (e.g. the text behind an HTTP 500).
     """
     try:
         body = _read_capped(e, max_body).decode("utf-8", errors="replace").strip()
@@ -104,15 +109,77 @@ def _format_http_error(e, max_body=500):
     if len(body) > max_body:
         body = body[:max_body] + f" ... ({len(body)} bytes total)"
     parts = [f"HTTP {e.code} {e.reason}"]
-    interesting = ("WWW-Authenticate", "Content-Type", "Server",
-                   "X-Request-Id", "X-Correlation-Id")
-    hdrs = [f"{name}: {e.headers.get(name)}" for name in interesting
-            if e.headers.get(name)]
-    if hdrs:
-        parts.append("headers={{{}}}".format(", ".join(hdrs)))
     if body:
         parts.append(f"body={body}")
     return " | ".join(parts)
+
+
+def _dump_request_lines(method, url, headers, body=None, max_body=800):
+    """Build a multi-line trace of an outgoing HTTP request for logging.
+
+    Returns a list of lines: the request line (">> METHOD URL"), every header
+    verbatim, then the body (truncated). Emitting the full request makes it
+    possible to see exactly what was sent when a discovery step fails — which
+    header the server rejected, whether the Accept was right, etc.
+    """
+    lines = [f">> {method} {url}"]
+    for k, v in (headers or {}).items():
+        lines.append(f"   {k}: {v}")
+    if body is not None:
+        b = body if isinstance(body, str) else body.decode("utf-8", errors="replace")
+        if len(b) > max_body:
+            b = b[:max_body] + f" ... ({len(b)} bytes total)"
+        lines.append(f"   body: {b}")
+    return lines
+
+
+def _dump_http_error_lines(e, max_body=1000):
+    """Build a multi-line trace of an HTTPError response for logging.
+
+    Includes the status line, EVERY response header (no allowlist filter, so
+    vendor trace headers survive), and the (truncated) body. Used to print the
+    raw server response when a discovery request fails, complementing the
+    one-line summary embedded in the RuntimeError message.
+    """
+    try:
+        body = _read_capped(e, max_body).decode("utf-8", errors="replace").strip()
+    except Exception:
+        body = ""
+    if len(body) > max_body:
+        body = body[:max_body] + f" ... ({len(body)} bytes total)"
+    lines = [f"<< HTTP {e.code} {e.reason}"]
+    if getattr(e, "headers", None):
+        for k, v in e.headers.items():
+            lines.append(f"   {k}: {v}")
+    if body:
+        lines.append(f"   body: {body}")
+    return lines
+
+
+def _dump_response_lines(resp, body_text, max_body=1000):
+    """Build a multi-line trace of a successful HTTP response for logging.
+
+    Mirrors _dump_http_error_lines but for a non-error response: status line,
+    every header, then the (truncated) body. Pass body_text="" to skip the body
+    (used when the body is a held-open stream that must not be read).
+    """
+    status = getattr(resp, "status", None) or resp.getcode()
+    bt = body_text or ""
+    if len(bt) > max_body:
+        bt = bt[:max_body] + f" ... ({len(bt)} bytes total)"
+    lines = [f"<< HTTP {status}"]
+    if getattr(resp, "headers", None):
+        for k, v in resp.headers.items():
+            lines.append(f"   {k}: {v}")
+    if bt:
+        lines.append(f"   body: {bt}")
+    return lines
+
+
+def _print_detail(tag, lines):
+    """Print each line prefixed with a category tag (e.g. "[discover]")."""
+    for line in lines:
+        print(f"   {tag} {line}")
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +325,8 @@ def _parse_resource_metadata_param(www_authenticate):
     return (m.group("q") or m.group("b")) if m else None
 
 
-def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES, accept=_MCP_ACCEPT):
+def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES, accept=_MCP_ACCEPT,
+                   log_tag="[discover]"):
     """GET ``url`` and return the decoded JSON object.
 
     Hardened for discovery against an MCP gateway that may answer a well-known
@@ -270,23 +338,32 @@ def _http_get_json(url, timeout=15, max_bytes=_MAX_BODY_BYTES, accept=_MCP_ACCEP
       4. read the body with a hard cap (never block on a stream)
     Any failure is normalized to a RuntimeError so callers can fall back.
     Pass accept="application/json" when talking to a plain IdP endpoint.
+
+    The full request and the full response (status, every header, body) are
+    printed under ``log_tag`` so a discovery failure shows exactly what was sent
+    and what came back. ``log_tag`` defaults to "[discover]"; use "[debug]" for
+    IdP (authorization server) metadata fetches.
     """
     req = urllib.request.Request(url, headers={"Accept": accept})
+    _print_detail(log_tag, _dump_request_lines("GET", url, {"Accept": accept}))
     try:
         resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
+        _print_detail(log_tag, _dump_http_error_lines(e))
         raise RuntimeError(f"{_format_http_error(e)} at {url}")
     except urllib.error.URLError as e:
+        print(f"   {log_tag} << URLError: {e.reason}")
         raise RuntimeError(f"Failed to fetch ({e.reason}) at {url}")
     with resp:
         status = getattr(resp, "status", None) or resp.getcode()
         ct = resp.headers.get("Content-Type", "")
+        body = _read_capped(resp, max_bytes).decode("utf-8", errors="replace")
+        _print_detail(log_tag, _dump_response_lines(resp, body))
         if not _is_json_content_type(ct):
             raise RuntimeError(
                 f"Expected application/json at {url} (HTTP {status}), "
                 f"got Content-Type {ct!r}"
             )
-        body = _read_capped(resp, max_bytes).decode("utf-8", errors="replace")
     try:
         return json.loads(body)
     except json.JSONDecodeError as e:
@@ -361,7 +438,8 @@ def fetch_as_metadata(issuer, timeout=15):
     for url in candidates:
         print(f"   [debug] trying AS metadata: {url}")
         try:
-            return _http_get_json(url, timeout=timeout, accept="application/json")
+            return _http_get_json(url, timeout=timeout, accept="application/json",
+                                  log_tag="[debug]")
         except RuntimeError as e:
             print(f"   [debug] -> {e}, trying next candidate...")
             last_error = e
@@ -468,6 +546,11 @@ def _probe_401_challenge(resource_url, timeout=15):
 
     Uses the no-redirect opener and never reads the 401 body, so an
     event-stream or HTML 401 cannot block us.
+
+    The full outgoing POST and the full response (status, every header, body)
+    are printed, so a non-401 reply (e.g. an MCP gateway that answers with a
+    500 instead of a proper challenge) leaves a complete trace of what the
+    server actually returned.
     """
     payload = {
         "jsonrpc": "2.0",
@@ -480,15 +563,14 @@ def _probe_401_challenge(resource_url, timeout=15):
         },
     }
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        resource_url.rstrip("/"),
-        data=data,
-        headers={"Content-Type": "application/json", "Accept": _MCP_ACCEPT},
-        method="POST",
-    )
+    headers = {"Content-Type": "application/json", "Accept": _MCP_ACCEPT}
+    target = resource_url.rstrip("/")
+    _print_detail("[discover]", _dump_request_lines("POST", target, headers, data))
+    req = urllib.request.Request(target, data=data, headers=headers, method="POST")
     try:
-        _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+        resp = _NO_REDIRECT_OPENER.open(req, timeout=timeout)
     except urllib.error.HTTPError as e:
+        _print_detail("[discover]", _dump_http_error_lines(e))
         if e.code != 401:
             raise RuntimeError(
                 f"Expected 401 challenge but got HTTP {e.code} "
@@ -509,9 +591,21 @@ def _probe_401_challenge(resource_url, timeout=15):
         print(f"   [discover] 401 resource_metadata pointed to: {meta_url}")
         return _http_get_json(meta_url, timeout=timeout)
     except urllib.error.URLError as e:
+        print(f"   [discover] << URLError: {e.reason}")
         raise RuntimeError(f"Failed to reach resource for 401 probe ({e.reason})")
-    # No 401 raised -> the resource is not protected through this path
-    raise RuntimeError("No 401 challenge received (resource may be public)")
+    # No 401 raised -> the resource returned a success status. The body is NOT
+    # read because an MCP Streamable HTTP server may answer initialize with a
+    # held-open SSE stream that would block; the status + headers are enough to
+    # explain why no challenge was issued.
+    status = getattr(resp, "status", None) or resp.getcode()
+    _print_detail("[discover]", _dump_response_lines(resp, ""))
+    try:
+        resp.close()
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"No 401 challenge received (got HTTP {status}; resource may be public)"
+    )
 
 
 def discover_issuer(resource_url, timeout=15):
