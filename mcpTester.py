@@ -808,6 +808,8 @@ class OAuthClient:
                 )
             print(f"   [config] resource      = {self.resource_url}  (RFC 8707)")
 
+        print(cyan("   Starting discovery flow ..."))
+
         # If issuer is not configured, discover it from the resource (RFC 9728)
         if not self.issuer:
             if not self.resource_url:
